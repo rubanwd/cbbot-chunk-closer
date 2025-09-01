@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Binance USDT‑M Futures chunk-closer bot
+Binance USDT-M Futures chunk-closer bot (one-file snapshots + daily cleanup)
 
 Функции:
 1) Каждую минуту получает баланс фьючерсного счёта и открытые позиции.
-   Печатает в консоль и пишет снапшоты в файлы.
-2) Если открытых позиций > 1, сортирует их по времени (updateTime) и делит на чанки по 2.
-   Логирует чанки в консоль и в отдельный CSV.
-3) Если внутри чанка разница по PnL двух позиций > ENV(PNL_DIFF_USD),
-   закрывает ОБЕ позиции рыночными ордерами (reduceOnly) и пишет отдельный лог/CSV.
-   
-Важные заметки
-- Бот работает с UM (USDT‑Margined) фьючерсами через официальный SDK: binance-um-futures.
-- По умолчанию DRY_RUN=true (ничего не закрывает). Чтобы реально торговать, выставьте DRY_RUN=false в .env.
-- В регионах с ограничениями (HTTP 451) запросы могут падать. Бот это логирует и продолжит попытки.
-- "Дата открытия" берётся из поля updateTime позиции (это приблизительно время последнего изменения позиции).
-  Для строгой даты открытия нужен разбор истории сделок; при желании можно доработать (см. TODO в коде).
+   Печатает в консоль и пишет снапшоты в ДВА фиксированных файла:
+   - data/snapshots/balance.json
+   - data/snapshots/positions.json
+   Раз в сутки папка snapshots/ очищается от старых файлов.
+2) Если открытых позиций > 1, сортирует их по времени (updateTime) и делит на пары (чанки по 2).
+   Логирует чанки в консоль и в CSV data/positions_chunks.csv.
+3) Для каждой пары, если |PnL1 - PnL2| > ENV(PNL_DIFF_USD), закрывает ОБЕ позиции
+   рыночными reduceOnly ордерами и логирует закрытие в файл и CSV.
 
-Автор: ChatGPT (GPT-5 Thinking)
+ENV:
+- BINANCE_API_KEY, BINANCE_API_SECRET (обязательны)
+- PNL_DIFF_USD=40
+- DRY_RUN=true/false   (по умолчанию true — только логирует)
+- OUTPUT_DIR=./data    (куда писать логи/CSV/снапшоты)
+- POLL_INTERVAL_SECONDS=60
+- BINANCE_BASE_URL=https://fapi.binance.com (или тестнет)
 """
+
 import os
 import time
 import csv
@@ -34,24 +37,31 @@ from typing import Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 
-# Официальный SDK от Binance для UM фьючерсов
-# pip install binance-um-futures
+# Официальный SDK для UM-фьючерсов:
+# pip install binance-futures-connector
 from binance.um_futures import UMFutures
 from binance.error import ClientError, ServerError
 
-# ---------------------------- Константы/настройка ----------------------------
+
+# ---------------------------- Константы/пути ----------------------------
 
 APP_NAME = "binance_futures_chunk_closer"
+
 BASE_DIR = Path(os.getenv("OUTPUT_DIR", "./data")).resolve()
 LOGS_DIR = BASE_DIR / "logs"
 SNAP_DIR = BASE_DIR / "snapshots"
+
+SNAP_BALANCE_FILE = SNAP_DIR / "balance.json"
+SNAP_POSITIONS_FILE = SNAP_DIR / "positions.json"
+
 CHUNKS_CSV = BASE_DIR / "positions_chunks.csv"
 POSITIONS_CSV = BASE_DIR / "positions.csv"
 CLOSURES_LOG = LOGS_DIR / "closures.log"
 CLOSURES_CSV = BASE_DIR / "closures.csv"
 
-DEFAULT_BASE_URL = "https://fapi.binance.com"  # UM фьючерсы
+DEFAULT_BASE_URL = os.getenv("BINANCE_BASE_URL", "https://fapi.binance.com")
 POLL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
+
 
 # ---------------------------- Утилиты ----------------------------
 
@@ -86,18 +96,15 @@ def ts_ms_to_iso(ms: int) -> str:
 
 
 def round_step(quantity: float, step_size: float) -> float:
-    """
-    Округление количества под LOT_SIZE (stepSize).
-    """
+    """Округление количества под LOT_SIZE (stepSize)."""
     if step_size <= 0:
         return quantity
     precision = int(round(-math.log10(step_size), 0)) if step_size < 1 else 0
-    # Безопасное "обрезание" до шага
-    q = math.floor(quantity / step_size) * step_size
+    q = math.floor(quantity / step_size) * step_size  # безопасное "обрезание"
     return float(f"{q:.{precision}f}")
 
 
-# ---------------------------- Binance обёртки ----------------------------
+# ---------------------------- Binance API ----------------------------
 
 class BinanceClient:
     def __init__(self, key: str, secret: str, base_url: str = DEFAULT_BASE_URL):
@@ -123,14 +130,14 @@ class BinanceClient:
         return self.client.balance()
 
     def position_risk(self) -> List[dict]:
-        # Возвращает список по всем символам (и сторонам в хедж-режиме)
+        # список по всем символам (и сторонам в хедж-режиме)
         return self.client.get_position_risk()
 
     def market_close(self, symbol: str, position_amt: float, position_side: str = "BOTH") -> dict:
         """
         Закрывает позицию рыночным ордером reduceOnly.
-        Для one-way: side противоположная знаку position_amt.
-        Для hedge: нужен корректный positionSide ("LONG" или "SHORT").
+        Для one-way: side = SELL если amt>0, иначе BUY.
+        Для hedge: нужен корректный positionSide ("LONG"/"SHORT").
         """
         if position_amt == 0:
             return {"skipped": True, "reason": "zero position"}
@@ -140,7 +147,6 @@ class BinanceClient:
         step = exch.get("marketStepSize") or exch.get("stepSize") or 0.0
         qty = round_step(abs(position_amt), step) if step else abs(position_amt)
         params = dict(symbol=symbol, side=side, type="MARKET", quantity=qty, reduceOnly="true")
-        # В режиме хеджа явно укажем позиционную сторону
         if position_side and position_side != "BOTH":
             params["positionSide"] = position_side
         return self.client.new_order(**params)
@@ -158,7 +164,7 @@ class ChunkCloserBot:
 
         self.api_key = os.getenv("BINANCE_API_KEY", "").strip()
         self.api_secret = os.getenv("BINANCE_API_SECRET", "").strip()
-        self.base_url = os.getenv("BINANCE_BASE_URL", DEFAULT_BASE_URL)
+        self.base_url = DEFAULT_BASE_URL
 
         self.pnl_diff_usd = float(os.getenv("PNL_DIFF_USD", "40"))
         self.dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
@@ -175,35 +181,54 @@ class ChunkCloserBot:
         # CSV заголовки
         if not CHUNKS_CSV.exists():
             with open(CHUNKS_CSV, "w", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
-                w.writerow(["ts", "chunk_id", "symbol", "positionSide", "open_time_iso", "pnl_unrealized"])
+                csv.writer(f).writerow(
+                    ["ts", "chunk_id", "symbol", "positionSide", "open_time_iso", "pnl_unrealized"]
+                )
         if not POSITIONS_CSV.exists():
             with open(POSITIONS_CSV, "w", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
-                w.writerow(["ts", "symbol", "positionSide", "positionAmt", "entryPrice", "pnl_unrealized", "updateTime_iso"])
+                csv.writer(f).writerow(
+                    ["ts", "symbol", "positionSide", "positionAmt", "entryPrice", "pnl_unrealized", "updateTime_iso"]
+                )
         if not CLOSURES_CSV.exists():
             with open(CLOSURES_CSV, "w", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
-                w.writerow(["close_ts", "symbol1", "symbol2", "posSide1", "posSide2", "open_time1", "open_time2",
-                            "pnl1", "pnl2", "pnl_diff_abs", "dry_run", "order_id_1", "order_id_2"])
+                csv.writer(f).writerow(
+                    ["close_ts", "symbol1", "symbol2", "posSide1", "posSide2",
+                     "open_time1", "open_time2", "pnl1", "pnl2", "pnl_diff_abs",
+                     "dry_run", "order_id_1", "order_id_2"]
+                )
 
         self._stop = False
-        signal.signal(signal.SIGINT, self._sig_stop)
-        signal.signal(signal.SIGTERM, self._sig_stop)
+        self._last_cleanup_day = None
+        self.daily_cleanup(force=True)
+
+        try:
+            signal.signal(signal.SIGINT, self._sig_stop)
+            signal.signal(signal.SIGTERM, self._sig_stop)
+        except Exception:
+            pass  # на некоторых платформах SIGTERM недоступен
 
     def _sig_stop(self, *args):
         self._stop = True
         self.logger.info("Остановка по сигналу...")
 
-    # ------------------------ шаг 1: снимок аккаунта ------------------------
+    # -------- ежедневная очистка снапшотов --------
+    def daily_cleanup(self, force: bool = False):
+        """Раз в сутки чистит snapshots/, оставляя только balance.json и positions.json."""
+        today = datetime.now().date()
+        if force or self._last_cleanup_day != today:
+            SNAP_DIR.mkdir(parents=True, exist_ok=True)
+            keep = {"balance.json", "positions.json"}
+            for p in SNAP_DIR.glob("*"):
+                if p.is_file() and p.name not in keep:
+                    try:
+                        p.unlink()
+                    except Exception as e:
+                        self.logger.warning("Не удалось удалить %s: %s", p, e)
+            self._last_cleanup_day = today
+            self.logger.info("Ежедневная очистка snapshots выполнена.")
 
+    # -------- Шаг 1: баланс и позиции + снапшоты --------
     def fetch_and_log_account(self) -> Tuple[dict, List[dict]]:
-        """
-        Возвращает (balance_summary, positions_open)
-        balance_summary: {'USDT': {...}, ...}
-        positions_open: список открытых позиций (abs(positionAmt)>0) с ключами:
-          symbol, positionAmt(float), entryPrice(float), unRealizedProfit(float), updateTime(int), positionSide(str)
-        """
         try:
             bal_list = self.client.balance()
         except (ClientError, ServerError) as e:
@@ -227,31 +252,30 @@ class ChunkCloserBot:
                 amt = float(p.get("positionAmt", "0"))
                 if abs(amt) < 1e-12:
                     continue
-                pos = {
+                positions_open.append({
                     "symbol": p.get("symbol"),
                     "positionAmt": amt,
                     "entryPrice": float(p.get("entryPrice", "0")),
                     "unRealizedProfit": float(p.get("unRealizedProfit", "0")),
                     "updateTime": int(p.get("updateTime", 0)),
                     "positionSide": p.get("positionSide", "BOTH"),
-                }
-                positions_open.append(pos)
+                })
             except Exception as ex:
                 self.logger.warning("Skip malformed position: %s | err=%s", p, ex)
 
-        # Снапшоты
-        ts = int(time.time())
-        SNAP_DIR.mkdir(parents=True, exist_ok=True)
-        with open(SNAP_DIR / f"balance_{ts}.json", "w", encoding="utf-8") as f:
+        # —— снапшоты (перезапись двух файлов) + ежедневная очистка
+        self.daily_cleanup()
+        with open(SNAP_BALANCE_FILE, "w", encoding="utf-8") as f:
             json.dump(balance_summary, f, ensure_ascii=False, indent=2)
-        with open(SNAP_DIR / f"positions_{ts}.json", "w", encoding="utf-8") as f:
+        with open(SNAP_POSITIONS_FILE, "w", encoding="utf-8") as f:
             json.dump(positions_open, f, ensure_ascii=False, indent=2)
 
         # CSV позиций
         with open(POSITIONS_CSV, "a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
+            now_iso = datetime.now().isoformat()
             for po in positions_open:
-                w.writerow([datetime.now().isoformat(), po["symbol"], po["positionSide"], po["positionAmt"],
+                w.writerow([now_iso, po["symbol"], po["positionSide"], po["positionAmt"],
                             po["entryPrice"], po["unRealizedProfit"], ts_ms_to_iso(po["updateTime"])])
 
         # Консольный вывод
@@ -266,18 +290,11 @@ class ChunkCloserBot:
 
         return balance_summary, positions_open
 
-    # ------------------------ шаг 2: чанки по 2 -----------------------------
-
+    # -------- Шаг 2: чанки по 2 --------
     @staticmethod
     def make_chunks(positions_open: List[dict]) -> List[List[dict]]:
-        """
-        Сортировка по updateTime (как приблизительный "время открытия") и разбиение на пары.
-        """
         pos_sorted = sorted(positions_open, key=lambda x: x.get("updateTime", 0))
-        chunks = []
-        for i in range(0, len(pos_sorted) - 1, 2):
-            chunks.append([pos_sorted[i], pos_sorted[i + 1]])
-        return chunks
+        return [pos_sorted[i:i+2] for i in range(0, len(pos_sorted) - 1, 2)]
 
     def log_chunks(self, chunks: List[List[dict]]):
         if not chunks:
@@ -288,16 +305,15 @@ class ChunkCloserBot:
         with open(CHUNKS_CSV, "a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             for idx, pair in enumerate(chunks, start=1):
+                a, b = pair
                 self.logger.info("  #%d: %s(%s) PnL=%.2f | %s(%s) PnL=%.2f",
-                                 idx,
-                                 pair[0]["symbol"], pair[0]["positionSide"], pair[0]["unRealizedProfit"],
-                                 pair[1]["symbol"], pair[1]["positionSide"], pair[1]["unRealizedProfit"])
+                                 idx, a["symbol"], a["positionSide"], a["unRealizedProfit"],
+                                 b["symbol"], b["positionSide"], b["unRealizedProfit"])
                 for po in pair:
                     w.writerow([now_iso, idx, po["symbol"], po["positionSide"],
                                 ts_ms_to_iso(po["updateTime"]), po["unRealizedProfit"]])
 
-    # ------------------------ шаг 3: закрытие пар ---------------------------
-
+    # -------- Шаг 3: возможное закрытие пары --------
     def maybe_close_chunk(self, pair: List[dict]):
         if len(pair) != 2:
             return
@@ -306,41 +322,34 @@ class ChunkCloserBot:
         pnl_b = float(b["unRealizedProfit"])
         diff = abs(pnl_a - pnl_b)
         if diff <= self.pnl_diff_usd:
-            self.logger.info("ΔPnL=%.2f ≤ %.2f — закрывать не будем (%s vs %s).",
+            self.logger.info("ΔPnL=%.2f ≤ %.2f — не закрываем (%s vs %s).",
                              diff, self.pnl_diff_usd, a["symbol"], b["symbol"])
             return
 
-        self.logger.warning("ΔPnL=%.2f > %.2f — закрываем ОБЕ позиции: %s(%s) и %s(%s)",
+        self.logger.warning("ΔPnL=%.2f > %.2f — закрываем ОБЕ: %s(%s) и %s(%s)",
                             diff, self.pnl_diff_usd, a["symbol"], a["positionSide"], b["symbol"], b["positionSide"])
 
         order1 = order2 = None
         if self.dry_run:
-            self.logger.warning("DRY_RUN=true — имитируем закрытие без отправки ордеров.")
+            self.logger.warning("DRY_RUN=true — имитация без отправки ордеров.")
         else:
             try:
                 order1 = self.client.market_close(
-                    symbol=a["symbol"],
-                    position_amt=a["positionAmt"],
-                    position_side=a["positionSide"]
+                    symbol=a["symbol"], position_amt=a["positionAmt"], position_side=a["positionSide"]
                 )
-                time.sleep(0.2)  # небольшая пауза
+                time.sleep(0.2)
                 order2 = self.client.market_close(
-                    symbol=b["symbol"],
-                    position_amt=b["positionAmt"],
-                    position_side=b["positionSide"]
+                    symbol=b["symbol"], position_amt=b["positionAmt"], position_side=b["positionSide"]
                 )
             except (ClientError, ServerError) as e:
                 self.logger.error("Ошибка при закрытии: %s", e)
 
-        # Логи закрытия
         close_iso = datetime.now().isoformat()
         self.closures_logger.info(
             "CLOSE | %s & %s | posSides: %s/%s | ΔPnL=%.2f | openA=%s openB=%s | dry_run=%s",
             a["symbol"], b["symbol"], a["positionSide"], b["positionSide"], diff,
             ts_ms_to_iso(a["updateTime"]), ts_ms_to_iso(b["updateTime"]), self.dry_run
         )
-
-        # CSV закрытий
         with open(CLOSURES_CSV, "a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow([close_iso,
@@ -352,10 +361,9 @@ class ChunkCloserBot:
                         (order1 or {}).get("orderId") if isinstance(order1, dict) else None,
                         (order2 or {}).get("orderId") if isinstance(order2, dict) else None])
 
-    # ------------------------ основной цикл ---------------------------------
-
+    # -------- Цикл --------
     def run_once(self):
-        bal, positions = self.fetch_and_log_account()
+        _, positions = self.fetch_and_log_account()
         if len(positions) > 1:
             chunks = self.make_chunks(positions)
             self.log_chunks(chunks)
@@ -372,9 +380,7 @@ class ChunkCloserBot:
                 self.run_once()
             except Exception as e:
                 self.logger.exception("Ошибка в итерации: %s", e)
-            # Досыпаем до целевой периодичности
-            elapsed = time.time() - start
-            sleep_s = max(0.0, POLL_SECONDS - elapsed)
+            sleep_s = max(0.0, POLL_SECONDS - (time.time() - start))
             time.sleep(sleep_s)
 
 
