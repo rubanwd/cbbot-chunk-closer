@@ -3,24 +3,11 @@
 """
 Binance USDT-M Futures chunk-closer bot (one-file snapshots + daily cleanup)
 
-Функции:
-1) Каждую минуту получает баланс фьючерсного счёта и открытые позиции.
-   Печатает в консоль и пишет снапшоты в ДВА фиксированных файла:
-   - data/snapshots/balance.json
-   - data/snapshots/positions.json
-   Раз в сутки папка snapshots/ очищается от старых файлов.
-2) Если открытых позиций > 1, сортирует их по времени (updateTime) и делит на пары (чанки по 2).
-   Логирует чанки в консоль и в CSV data/positions_chunks.csv.
-3) Для каждой пары, если |PnL1 - PnL2| > ENV(PNL_DIFF_USD), закрывает ОБЕ позиции
-   рыночными reduceOnly ордерами и логирует закрытие в файл и CSV.
+Режим сравнения PnL:
+- PNL_GAP_MODE=magnitude (по умолчанию): gap = | |PnL1| - |PnL2| |
+- PNL_GAP_MODE=signed:    gap = | PnL1 - PnL2 |
 
-ENV:
-- BINANCE_API_KEY, BINANCE_API_SECRET (обязательны)
-- PNL_DIFF_USD=40
-- DRY_RUN=true/false   (по умолчанию true — только логирует)
-- OUTPUT_DIR=./data    (куда писать логи/CSV/снапшоты)
-- POLL_INTERVAL_SECONDS=60
-- BINANCE_BASE_URL=https://fapi.binance.com (или тестнет)
+Условия закрытия чанка: gap > PNL_DIFF_USD.
 """
 
 import os
@@ -33,17 +20,11 @@ import logging
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 from dotenv import load_dotenv
-
-# Официальный SDK для UM-фьючерсов:
-# pip install binance-futures-connector
 from binance.um_futures import UMFutures
 from binance.error import ClientError, ServerError
-
-
-# ---------------------------- Константы/пути ----------------------------
 
 APP_NAME = "binance_futures_chunk_closer"
 
@@ -62,31 +43,22 @@ CLOSURES_CSV = BASE_DIR / "closures.csv"
 DEFAULT_BASE_URL = os.getenv("BINANCE_BASE_URL", "https://fapi.binance.com")
 POLL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 
-
-# ---------------------------- Утилиты ----------------------------
-
-def setup_loggers(verbose: bool = True) -> Tuple[logging.Logger, logging.Logger]:
+def setup_loggers(verbose: bool = True):
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger(APP_NAME)
     logger.setLevel(logging.INFO if verbose else logging.WARNING)
     fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
 
-    ch = logging.StreamHandler()
-    ch.setFormatter(fmt)
-    logger.addHandler(ch)
-
+    ch = logging.StreamHandler(); ch.setFormatter(fmt); logger.addHandler(ch)
     fh = RotatingFileHandler(LOGS_DIR / f"{APP_NAME}.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8")
-    fh.setFormatter(fmt)
-    logger.addHandler(fh)
+    fh.setFormatter(fmt); logger.addHandler(fh)
 
     closures_logger = logging.getLogger(APP_NAME + ".closures")
     closures_logger.setLevel(logging.INFO)
     fh2 = RotatingFileHandler(CLOSURES_LOG, maxBytes=5_000_000, backupCount=3, encoding="utf-8")
-    fh2.setFormatter(fmt)
-    closures_logger.addHandler(fh2)
+    fh2.setFormatter(fmt); closures_logger.addHandler(fh2)
 
     return logger, closures_logger
-
 
 def ts_ms_to_iso(ms: int) -> str:
     try:
@@ -94,22 +66,17 @@ def ts_ms_to_iso(ms: int) -> str:
     except Exception:
         return ""
 
-
 def round_step(quantity: float, step_size: float) -> float:
-    """Округление количества под LOT_SIZE (stepSize)."""
     if step_size <= 0:
         return quantity
     precision = int(round(-math.log10(step_size), 0)) if step_size < 1 else 0
-    q = math.floor(quantity / step_size) * step_size  # безопасное "обрезание"
+    q = math.floor(quantity / step_size) * step_size
     return float(f"{q:.{precision}f}")
-
-
-# ---------------------------- Binance API ----------------------------
 
 class BinanceClient:
     def __init__(self, key: str, secret: str, base_url: str = DEFAULT_BASE_URL):
         self.client = UMFutures(key=key, secret=secret, base_url=base_url)
-        self._exchange_info = None  # кэш фильтров
+        self._exchange_info = None
 
     def exchange_info(self) -> Dict[str, dict]:
         if self._exchange_info is None:
@@ -130,18 +97,11 @@ class BinanceClient:
         return self.client.balance()
 
     def position_risk(self) -> List[dict]:
-        # список по всем символам (и сторонам в хедж-режиме)
         return self.client.get_position_risk()
 
     def market_close(self, symbol: str, position_amt: float, position_side: str = "BOTH") -> dict:
-        """
-        Закрывает позицию рыночным ордером reduceOnly.
-        Для one-way: side = SELL если amt>0, иначе BUY.
-        Для hedge: нужен корректный positionSide ("LONG"/"SHORT").
-        """
         if position_amt == 0:
             return {"skipped": True, "reason": "zero position"}
-
         side = "SELL" if position_amt > 0 else "BUY"
         exch = self.exchange_info().get(symbol, {})
         step = exch.get("marketStepSize") or exch.get("stepSize") or 0.0
@@ -150,9 +110,6 @@ class BinanceClient:
         if position_side and position_side != "BOTH":
             params["positionSide"] = position_side
         return self.client.new_order(**params)
-
-
-# ---------------------------- Основная логика ----------------------------
 
 class ChunkCloserBot:
     def __init__(self):
@@ -167,6 +124,11 @@ class ChunkCloserBot:
         self.base_url = DEFAULT_BASE_URL
 
         self.pnl_diff_usd = float(os.getenv("PNL_DIFF_USD", "40"))
+        # НОВОЕ: режим расчёта разрыва между PnL
+        self.pnl_gap_mode = os.getenv("PNL_GAP_MODE", "magnitude").lower().strip()
+        if self.pnl_gap_mode not in ("magnitude", "signed"):
+            self.pnl_gap_mode = "magnitude"
+
         self.dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
 
         if not self.api_key or not self.api_secret:
@@ -175,10 +137,10 @@ class ChunkCloserBot:
 
         self.client = BinanceClient(self.api_key, self.api_secret, self.base_url)
 
-        self.logger.info("Старт бота. DRY_RUN=%s, PNL_DIFF_USD=%.2f", self.dry_run, self.pnl_diff_usd)
+        self.logger.info("Старт бота. DRY_RUN=%s, PNL_DIFF_USD=%.2f, GAP_MODE=%s",
+                         self.dry_run, self.pnl_diff_usd, self.pnl_gap_mode)
         self.logger.info("База данных/логов: %s", str(BASE_DIR))
 
-        # CSV заголовки
         if not CHUNKS_CSV.exists():
             with open(CHUNKS_CSV, "w", newline="", encoding="utf-8") as f:
                 csv.writer(f).writerow(
@@ -205,36 +167,30 @@ class ChunkCloserBot:
             signal.signal(signal.SIGINT, self._sig_stop)
             signal.signal(signal.SIGTERM, self._sig_stop)
         except Exception:
-            pass  # на некоторых платформах SIGTERM недоступен
+            pass
 
     def _sig_stop(self, *args):
         self._stop = True
         self.logger.info("Остановка по сигналу...")
 
-    # -------- ежедневная очистка снапшотов --------
     def daily_cleanup(self, force: bool = False):
-        """Раз в сутки чистит snapshots/, оставляя только balance.json и positions.json."""
         today = datetime.now().date()
         if force or self._last_cleanup_day != today:
             SNAP_DIR.mkdir(parents=True, exist_ok=True)
             keep = {"balance.json", "positions.json"}
             for p in SNAP_DIR.glob("*"):
                 if p.is_file() and p.name not in keep:
-                    try:
-                        p.unlink()
-                    except Exception as e:
-                        self.logger.warning("Не удалось удалить %s: %s", p, e)
+                    try: p.unlink()
+                    except Exception as e: self.logger.warning("Не удалось удалить %s: %s", p, e)
             self._last_cleanup_day = today
             self.logger.info("Ежедневная очистка snapshots выполнена.")
 
-    # -------- Шаг 1: баланс и позиции + снапшоты --------
     def fetch_and_log_account(self) -> Tuple[dict, List[dict]]:
         try:
             bal_list = self.client.balance()
         except (ClientError, ServerError) as e:
             self.logger.error("Balance error: %s", e)
             bal_list = []
-
         balance_summary = {b.get("asset"): b for b in bal_list}
         usdt_total = balance_summary.get("USDT", {}).get("balance")
         usdt_avail = balance_summary.get("USDT", {}).get("availableBalance")
@@ -250,8 +206,7 @@ class ChunkCloserBot:
         for p in pr_list:
             try:
                 amt = float(p.get("positionAmt", "0"))
-                if abs(amt) < 1e-12:
-                    continue
+                if abs(amt) < 1e-12: continue
                 positions_open.append({
                     "symbol": p.get("symbol"),
                     "positionAmt": amt,
@@ -263,14 +218,12 @@ class ChunkCloserBot:
             except Exception as ex:
                 self.logger.warning("Skip malformed position: %s | err=%s", p, ex)
 
-        # —— снапшоты (перезапись двух файлов) + ежедневная очистка
         self.daily_cleanup()
         with open(SNAP_BALANCE_FILE, "w", encoding="utf-8") as f:
             json.dump(balance_summary, f, ensure_ascii=False, indent=2)
         with open(SNAP_POSITIONS_FILE, "w", encoding="utf-8") as f:
             json.dump(positions_open, f, ensure_ascii=False, indent=2)
 
-        # CSV позиций
         with open(POSITIONS_CSV, "a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             now_iso = datetime.now().isoformat()
@@ -278,7 +231,6 @@ class ChunkCloserBot:
                 w.writerow([now_iso, po["symbol"], po["positionSide"], po["positionAmt"],
                             po["entryPrice"], po["unRealizedProfit"], ts_ms_to_iso(po["updateTime"])])
 
-        # Консольный вывод
         if positions_open:
             self.logger.info("Открытые позиции (%d):", len(positions_open))
             for po in positions_open:
@@ -287,10 +239,8 @@ class ChunkCloserBot:
                                  po["entryPrice"], po["unRealizedProfit"], ts_ms_to_iso(po["updateTime"]))
         else:
             self.logger.info("Открытых позиций нет.")
-
         return balance_summary, positions_open
 
-    # -------- Шаг 2: чанки по 2 --------
     @staticmethod
     def make_chunks(positions_open: List[dict]) -> List[List[dict]]:
         pos_sorted = sorted(positions_open, key=lambda x: x.get("updateTime", 0))
@@ -313,21 +263,29 @@ class ChunkCloserBot:
                     w.writerow([now_iso, idx, po["symbol"], po["positionSide"],
                                 ts_ms_to_iso(po["updateTime"]), po["unRealizedProfit"]])
 
-    # -------- Шаг 3: возможное закрытие пары --------
+    def _calc_gap(self, pnl_a: float, pnl_b: float) -> float:
+        if self.pnl_gap_mode == "magnitude":
+            return abs(abs(pnl_a) - abs(pnl_b))
+        # signed
+        return abs(pnl_a - pnl_b)
+
     def maybe_close_chunk(self, pair: List[dict]):
-        if len(pair) != 2:
-            return
+        if len(pair) != 2: return
         a, b = pair
         pnl_a = float(a["unRealizedProfit"])
         pnl_b = float(b["unRealizedProfit"])
-        diff = abs(pnl_a - pnl_b)
-        if diff <= self.pnl_diff_usd:
-            self.logger.info("ΔPnL=%.2f ≤ %.2f — не закрываем (%s vs %s).",
-                             diff, self.pnl_diff_usd, a["symbol"], b["symbol"])
+        gap = self._calc_gap(pnl_a, pnl_b)
+
+        self.logger.info("Gap(%s) между %s и %s: %.2f (порог %.2f)",
+                         self.pnl_gap_mode, a["symbol"], b["symbol"], gap, self.pnl_diff_usd)
+
+        if gap <= self.pnl_diff_usd:
+            self.logger.info("Gap=%.2f ≤ %.2f — не закрываем (%s vs %s).",
+                             gap, self.pnl_diff_usd, a["symbol"], b["symbol"])
             return
 
-        self.logger.warning("ΔPnL=%.2f > %.2f — закрываем ОБЕ: %s(%s) и %s(%s)",
-                            diff, self.pnl_diff_usd, a["symbol"], a["positionSide"], b["symbol"], b["positionSide"])
+        self.logger.warning("Gap=%.2f > %.2f — закрываем ОБЕ: %s(%s) и %s(%s)",
+                            gap, self.pnl_diff_usd, a["symbol"], a["positionSide"], b["symbol"], b["positionSide"])
 
         order1 = order2 = None
         if self.dry_run:
@@ -346,22 +304,22 @@ class ChunkCloserBot:
 
         close_iso = datetime.now().isoformat()
         self.closures_logger.info(
-            "CLOSE | %s & %s | posSides: %s/%s | ΔPnL=%.2f | openA=%s openB=%s | dry_run=%s",
-            a["symbol"], b["symbol"], a["positionSide"], b["positionSide"], diff,
+            "CLOSE | mode=%s | %s & %s | posSides: %s/%s | Gap=%.2f | openA=%s openB=%s | dry_run=%s",
+            self.pnl_gap_mode, a["symbol"], b["symbol"], a["positionSide"], b["positionSide"], gap,
             ts_ms_to_iso(a["updateTime"]), ts_ms_to_iso(b["updateTime"]), self.dry_run
         )
         with open(CLOSURES_CSV, "a", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow([close_iso,
-                        a["symbol"], b["symbol"],
-                        a["positionSide"], b["positionSide"],
-                        ts_ms_to_iso(a["updateTime"]), ts_ms_to_iso(b["updateTime"]),
-                        pnl_a, pnl_b, diff,
-                        self.dry_run,
-                        (order1 or {}).get("orderId") if isinstance(order1, dict) else None,
-                        (order2 or {}).get("orderId") if isinstance(order2, dict) else None])
+            csv.writer(f).writerow([
+                close_iso,
+                a["symbol"], b["symbol"],
+                a["positionSide"], b["positionSide"],
+                ts_ms_to_iso(a["updateTime"]), ts_ms_to_iso(b["updateTime"]),
+                pnl_a, pnl_b, gap,  # колонка называется pnl_diff_abs, но теперь тут наш gap
+                self.dry_run,
+                (order1 or {}).get("orderId") if isinstance(order1, dict) else None,
+                (order2 or {}).get("orderId") if isinstance(order2, dict) else None
+            ])
 
-    # -------- Цикл --------
     def run_once(self):
         _, positions = self.fetch_and_log_account()
         if len(positions) > 1:
@@ -383,14 +341,12 @@ class ChunkCloserBot:
             sleep_s = max(0.0, POLL_SECONDS - (time.time() - start))
             time.sleep(sleep_s)
 
-
 def main():
     try:
         bot = ChunkCloserBot()
     except SystemExit:
         return
     bot.run_loop()
-
 
 if __name__ == "__main__":
     main()
