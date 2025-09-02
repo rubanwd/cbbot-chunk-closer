@@ -1,19 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Binance USDT-M Futures chunk-closer bot
+Binance USDT-M Futures chunk-closer bot (+ Telegram notify on close)
 
-Главное изменение:
-- По умолчанию PNL_GAP_MODE=plus: gap = pnl_a + pnl_b (суммарный PnL пары).
-  Закрываем ТОЛЬКО если gap > PNL_DIFF_USD (т.е. закрытие в плюс).
-- Для совместимости доступны режимы:
-  - PNL_GAP_MODE=magnitude -> gap = | |p1| - |p2| |
-  - PNL_GAP_MODE=signed    -> gap = | p1 - p2 |
+Ключевые моменты:
+- Снапшоты перезаписываются (balance.json, positions.json) + ежедневная очистка каталога snapshots/.
+- Логика «чанков» по 2 позиции. Закрытие по порогу GAP:
+    PNL_GAP_MODE=plus (по умолчанию): gap = pnl_a + pnl_b → закрываем только если gap > PNL_DIFF_USD.
+    magnitude: gap = | |p1| - |p2| |
+    signed:    gap = | p1 - p2 |
+- После закрытия ПАРЫ отправляется Telegram-отчёт:
+    • пары (символы, стороны, PnL)
+    • дата/время закрытия (локальное)
+    • значение GAP и порог
+    • «время жизни» чанка = now - max(updateTime обеих позиций)
 
-Остальное:
-- Снапшоты перезаписываются в два файла (balance.json, positions.json).
-- Ежедневная очистка папки snapshots/.
-- Чанки по 2 позиции, закрытие рыночными reduceOnly.
+ENV:
+- BINANCE_API_KEY, BINANCE_API_SECRET (обязательные)
+- OUTPUT_DIR=./data
+- POLL_INTERVAL_SECONDS=60
+- BINANCE_BASE_URL=https://fapi.binance.com
+- PNL_DIFF_USD=40
+- PNL_GAP_MODE=plus | magnitude | signed
+- DRY_RUN=true/false
+- TELEGRAM_BOT_TOKEN=<token>
+- TELEGRAM_CHAT_ID=<id>
+- TELEGRAM_SEND_IN_DRY_RUN=false   # если true — шлём отчёт даже в dry-run
 """
 
 import os
@@ -24,13 +36,15 @@ import math
 import signal
 import logging
 from logging.handlers import RotatingFileHandler
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 from dotenv import load_dotenv
 from binance.um_futures import UMFutures
 from binance.error import ClientError, ServerError
+
+from telegram_notifier import send_telegram_message
 
 APP_NAME = "binance_futures_chunk_closer"
 
@@ -71,6 +85,19 @@ def ts_ms_to_iso(ms: int) -> str:
         return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).astimezone().isoformat()
     except Exception:
         return ""
+
+def fmt_local(ts: datetime) -> str:
+    return ts.astimezone().strftime("%d %b %Y, %H:%M:%S %Z")
+
+def fmt_duration(secs: float) -> str:
+    if secs < 0: secs = 0
+    td = timedelta(seconds=int(secs))
+    days = td.days
+    hours, rem = divmod(td.seconds, 3600)
+    minutes, seconds = divmod(rem, 60)
+    if days > 0:
+        return f"{days}d {hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 def round_step(quantity: float, step_size: float) -> float:
     if step_size <= 0:
@@ -129,14 +156,19 @@ class ChunkCloserBot:
         self.api_secret = os.getenv("BINANCE_API_SECRET", "").strip()
         self.base_url = DEFAULT_BASE_URL
 
-        # --- ключевые настройки ---
+        # --- логика закрытия
         self.pnl_diff_usd = float(os.getenv("PNL_DIFF_USD", "40"))
-        # Новый дефолт: закрываем только «в плюс»
         self.pnl_gap_mode = os.getenv("PNL_GAP_MODE", "plus").lower().strip()
         if self.pnl_gap_mode not in ("plus", "magnitude", "signed"):
             self.pnl_gap_mode = "plus"
 
         self.dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
+
+        # --- Telegram
+        self.tg_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+        self.tg_chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+        self.tg_send_in_dry_run = os.getenv("TELEGRAM_SEND_IN_DRY_RUN", "false").lower() == "true"
+        self.tg_enabled = bool(self.tg_token and self.tg_chat_id)
 
         if not self.api_key or not self.api_secret:
             self.logger.error("API ключи не заданы. Укажите BINANCE_API_KEY и BINANCE_API_SECRET в .env")
@@ -145,8 +177,9 @@ class ChunkCloserBot:
         self.client = BinanceClient(self.api_key, self.api_secret, self.base_url)
 
         self.logger.info(
-            "Старт бота. DRY_RUN=%s, PNL_DIFF_USD=%.2f, GAP_MODE=%s, outdir=%s",
-            self.dry_run, self.pnl_diff_usd, self.pnl_gap_mode, str(BASE_DIR)
+            "Старт. DRY_RUN=%s, GAP_MODE=%s, PNL_DIFF_USD=%.2f, Telegram=%s",
+            self.dry_run, self.pnl_gap_mode, self.pnl_diff_usd,
+            "on" if self.tg_enabled else "off"
         )
 
         # CSV заголовки
@@ -182,7 +215,7 @@ class ChunkCloserBot:
         self._stop = True
         self.logger.info("Остановка по сигналу...")
 
-    # --- ежедневная очистка snapshots ---
+    # -------- housekeeping --------
     def daily_cleanup(self, force: bool = False):
         today = datetime.now().date()
         if force or self._last_cleanup_day != today:
@@ -197,7 +230,7 @@ class ChunkCloserBot:
             self._last_cleanup_day = today
             self.logger.info("Ежедневная очистка snapshots выполнена.")
 
-    # --- шаг 1: получить и залогировать аккаунт ---
+    # -------- data fetch --------
     def fetch_and_log_account(self) -> Tuple[dict, List[dict]]:
         try:
             bal_list = self.client.balance()
@@ -232,14 +265,12 @@ class ChunkCloserBot:
             except Exception as ex:
                 self.logger.warning("Skip malformed position: %s | err=%s", p, ex)
 
-        # перезаписываем 2 снапшота и, при смене дня, чистим каталог
         self.daily_cleanup()
         with open(SNAP_BALANCE_FILE, "w", encoding="utf-8") as f:
             json.dump(balance_summary, f, ensure_ascii=False, indent=2)
         with open(SNAP_POSITIONS_FILE, "w", encoding="utf-8") as f:
             json.dump(positions_open, f, ensure_ascii=False, indent=2)
 
-        # CSV позиций (строка на каждую позицию)
         with open(POSITIONS_CSV, "a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             now_iso = datetime.now().isoformat()
@@ -257,7 +288,7 @@ class ChunkCloserBot:
             self.logger.info("Открытых позиций нет.")
         return balance_summary, positions_open
 
-    # --- шаг 2: чанки по 2 ---
+    # -------- chunks --------
     @staticmethod
     def make_chunks(positions_open: List[dict]) -> List[List[dict]]:
         pos_sorted = sorted(positions_open, key=lambda x: x.get("updateTime", 0))
@@ -280,18 +311,15 @@ class ChunkCloserBot:
                     w.writerow([now_iso, idx, po["symbol"], po["positionSide"],
                                 ts_ms_to_iso(po["updateTime"]), po["unRealizedProfit"]])
 
-    # --- формула "гэп" ---
     def _calc_gap(self, pnl_a: float, pnl_b: float) -> float:
         mode = self.pnl_gap_mode
         if mode == "plus":
-            # закрываем только в плюс: gap = суммарный PnL пары
             return pnl_a + pnl_b
         if mode == "magnitude":
             return abs(abs(pnl_a) - abs(pnl_b))
-        # signed
         return abs(pnl_a - pnl_b)
 
-    # --- шаг 3: возможно закрыть пару ---
+    # -------- close pair + Telegram notify --------
     def maybe_close_chunk(self, pair: List[dict]):
         if len(pair) != 2:
             return
@@ -300,21 +328,20 @@ class ChunkCloserBot:
         pnl_b = float(b["unRealizedProfit"])
         gap = self._calc_gap(pnl_a, pnl_b)
 
-        self.logger.info("Gap(%s)=%0.2f vs threshold=%0.2f  |  pair=(%s:%0.2f, %s:%0.2f)",
+        self.logger.info("Gap(%s)=%.2f (th=%.2f) | pair=(%s:%.2f, %s:%.2f)",
                          self.pnl_gap_mode, gap, self.pnl_diff_usd,
                          a["symbol"], pnl_a, b["symbol"], pnl_b)
 
-        # В режиме 'plus' gap может быть отрицательным — это сигнал «не закрывать».
         if gap <= self.pnl_diff_usd:
             self.logger.info("Условия НЕ выполнены — не закрываем.")
             return
 
-        self.logger.warning("Условия выполнены ⇒ закрываем обе позиции: %s(%s) и %s(%s)",
+        self.logger.warning("Закрываем обе позиции: %s(%s) и %s(%s)",
                             a["symbol"], a["positionSide"], b["symbol"], b["positionSide"])
 
         order1 = order2 = None
         if self.dry_run:
-            self.logger.warning("DRY_RUN=true — имитация без отправки ордеров.")
+            self.logger.warning("DRY_RUN=true — имитация без ордеров.")
         else:
             try:
                 order1 = self.client.market_close(
@@ -327,7 +354,10 @@ class ChunkCloserBot:
             except (ClientError, ServerError) as e:
                 self.logger.error("Ошибка при закрытии: %s", e)
 
-        close_iso = datetime.now().isoformat()
+        close_dt_local = datetime.now().astimezone()
+        close_iso = close_dt_local.isoformat()
+
+        # лог и CSV закрытий
         self.closures_logger.info(
             "CLOSE | mode=%s | %s & %s | posSides: %s/%s | gap=%.2f | openA=%s openB=%s | dry_run=%s",
             self.pnl_gap_mode, a["symbol"], b["symbol"], a["positionSide"], b["positionSide"],
@@ -345,6 +375,31 @@ class ChunkCloserBot:
                 (order2 or {}).get("orderId") if isinstance(order2, dict) else None
             ])
 
+        # -------- Telegram отчёт --------
+        if self.tg_enabled and (not self.dry_run or self.tg_send_in_dry_run):
+            last_upd_ms = max(int(a.get("updateTime", 0)), int(b.get("updateTime", 0)))
+            last_upd_dt = datetime.fromtimestamp(last_upd_ms / 1000, tz=timezone.utc).astimezone()
+            chunk_age = fmt_duration((close_dt_local - last_upd_dt).total_seconds())
+
+            msg_lines = [
+                "Binance — Чанк закрыт",
+                f"Время закрытия: {fmt_local(close_dt_local)}",
+                f"Gap({self.pnl_gap_mode}) = {gap:.2f}  |  Порог = {self.pnl_diff_usd:.2f}",
+                f"Время существования чанка: {chunk_age}",
+                "",
+                f"• {a['symbol']}  {a['positionSide']}  amt={a['positionAmt']}  uPnL={pnl_a:.2f}",
+                f"  Последний апдейт: {last_upd_dt.isoformat()}",
+                f"• {b['symbol']}  {b['positionSide']}  amt={b['positionAmt']}  uPnL={pnl_b:.2f}",
+                "",
+                f"Dry-run: {self.dry_run}",
+            ]
+            _ok = send_telegram_message(self.tg_token, self.tg_chat_id, "\n".join(msg_lines))
+            if _ok:
+                self.logger.info("Отчёт отправлен в Telegram.")
+            else:
+                self.logger.warning("Не удалось отправить отчёт в Telegram.")
+
+    # -------- loop --------
     def run_once(self):
         _, positions = self.fetch_and_log_account()
         if len(positions) > 1:
