@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Binance USDT-M Futures chunk-closer bot (one-file snapshots + daily cleanup)
+Binance USDT-M Futures chunk-closer bot
 
-Режим сравнения PnL:
-- PNL_GAP_MODE=magnitude (по умолчанию): gap = | |PnL1| - |PnL2| |
-- PNL_GAP_MODE=signed:    gap = | PnL1 - PnL2 |
+Главное изменение:
+- По умолчанию PNL_GAP_MODE=plus: gap = pnl_a + pnl_b (суммарный PnL пары).
+  Закрываем ТОЛЬКО если gap > PNL_DIFF_USD (т.е. закрытие в плюс).
+- Для совместимости доступны режимы:
+  - PNL_GAP_MODE=magnitude -> gap = | |p1| - |p2| |
+  - PNL_GAP_MODE=signed    -> gap = | p1 - p2 |
 
-Условия закрытия чанка: gap > PNL_DIFF_USD.
+Остальное:
+- Снапшоты перезаписываются в два файла (balance.json, positions.json).
+- Ежедневная очистка папки snapshots/.
+- Чанки по 2 позиции, закрытие рыночными reduceOnly.
 """
 
 import os
@@ -123,11 +129,12 @@ class ChunkCloserBot:
         self.api_secret = os.getenv("BINANCE_API_SECRET", "").strip()
         self.base_url = DEFAULT_BASE_URL
 
+        # --- ключевые настройки ---
         self.pnl_diff_usd = float(os.getenv("PNL_DIFF_USD", "40"))
-        # НОВОЕ: режим расчёта разрыва между PnL
-        self.pnl_gap_mode = os.getenv("PNL_GAP_MODE", "magnitude").lower().strip()
-        if self.pnl_gap_mode not in ("magnitude", "signed"):
-            self.pnl_gap_mode = "magnitude"
+        # Новый дефолт: закрываем только «в плюс»
+        self.pnl_gap_mode = os.getenv("PNL_GAP_MODE", "plus").lower().strip()
+        if self.pnl_gap_mode not in ("plus", "magnitude", "signed"):
+            self.pnl_gap_mode = "plus"
 
         self.dry_run = os.getenv("DRY_RUN", "true").lower() == "true"
 
@@ -137,10 +144,12 @@ class ChunkCloserBot:
 
         self.client = BinanceClient(self.api_key, self.api_secret, self.base_url)
 
-        self.logger.info("Старт бота. DRY_RUN=%s, PNL_DIFF_USD=%.2f, GAP_MODE=%s",
-                         self.dry_run, self.pnl_diff_usd, self.pnl_gap_mode)
-        self.logger.info("База данных/логов: %s", str(BASE_DIR))
+        self.logger.info(
+            "Старт бота. DRY_RUN=%s, PNL_DIFF_USD=%.2f, GAP_MODE=%s, outdir=%s",
+            self.dry_run, self.pnl_diff_usd, self.pnl_gap_mode, str(BASE_DIR)
+        )
 
+        # CSV заголовки
         if not CHUNKS_CSV.exists():
             with open(CHUNKS_CSV, "w", newline="", encoding="utf-8") as f:
                 csv.writer(f).writerow(
@@ -154,8 +163,8 @@ class ChunkCloserBot:
         if not CLOSURES_CSV.exists():
             with open(CLOSURES_CSV, "w", newline="", encoding="utf-8") as f:
                 csv.writer(f).writerow(
-                    ["close_ts", "symbol1", "symbol2", "posSide1", "posSide2",
-                     "open_time1", "open_time2", "pnl1", "pnl2", "pnl_diff_abs",
+                    ["close_ts", "mode", "symbol1", "symbol2", "posSide1", "posSide2",
+                     "open_time1", "open_time2", "pnl1", "pnl2", "gap_value",
                      "dry_run", "order_id_1", "order_id_2"]
                 )
 
@@ -173,6 +182,7 @@ class ChunkCloserBot:
         self._stop = True
         self.logger.info("Остановка по сигналу...")
 
+    # --- ежедневная очистка snapshots ---
     def daily_cleanup(self, force: bool = False):
         today = datetime.now().date()
         if force or self._last_cleanup_day != today:
@@ -180,11 +190,14 @@ class ChunkCloserBot:
             keep = {"balance.json", "positions.json"}
             for p in SNAP_DIR.glob("*"):
                 if p.is_file() and p.name not in keep:
-                    try: p.unlink()
-                    except Exception as e: self.logger.warning("Не удалось удалить %s: %s", p, e)
+                    try:
+                        p.unlink()
+                    except Exception as e:
+                        self.logger.warning("Не удалось удалить %s: %s", p, e)
             self._last_cleanup_day = today
             self.logger.info("Ежедневная очистка snapshots выполнена.")
 
+    # --- шаг 1: получить и залогировать аккаунт ---
     def fetch_and_log_account(self) -> Tuple[dict, List[dict]]:
         try:
             bal_list = self.client.balance()
@@ -206,7 +219,8 @@ class ChunkCloserBot:
         for p in pr_list:
             try:
                 amt = float(p.get("positionAmt", "0"))
-                if abs(amt) < 1e-12: continue
+                if abs(amt) < 1e-12:
+                    continue
                 positions_open.append({
                     "symbol": p.get("symbol"),
                     "positionAmt": amt,
@@ -218,12 +232,14 @@ class ChunkCloserBot:
             except Exception as ex:
                 self.logger.warning("Skip malformed position: %s | err=%s", p, ex)
 
+        # перезаписываем 2 снапшота и, при смене дня, чистим каталог
         self.daily_cleanup()
         with open(SNAP_BALANCE_FILE, "w", encoding="utf-8") as f:
             json.dump(balance_summary, f, ensure_ascii=False, indent=2)
         with open(SNAP_POSITIONS_FILE, "w", encoding="utf-8") as f:
             json.dump(positions_open, f, ensure_ascii=False, indent=2)
 
+        # CSV позиций (строка на каждую позицию)
         with open(POSITIONS_CSV, "a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             now_iso = datetime.now().isoformat()
@@ -241,6 +257,7 @@ class ChunkCloserBot:
             self.logger.info("Открытых позиций нет.")
         return balance_summary, positions_open
 
+    # --- шаг 2: чанки по 2 ---
     @staticmethod
     def make_chunks(positions_open: List[dict]) -> List[List[dict]]:
         pos_sorted = sorted(positions_open, key=lambda x: x.get("updateTime", 0))
@@ -263,29 +280,37 @@ class ChunkCloserBot:
                     w.writerow([now_iso, idx, po["symbol"], po["positionSide"],
                                 ts_ms_to_iso(po["updateTime"]), po["unRealizedProfit"]])
 
+    # --- формула "гэп" ---
     def _calc_gap(self, pnl_a: float, pnl_b: float) -> float:
-        if self.pnl_gap_mode == "magnitude":
+        mode = self.pnl_gap_mode
+        if mode == "plus":
+            # закрываем только в плюс: gap = суммарный PnL пары
+            return pnl_a + pnl_b
+        if mode == "magnitude":
             return abs(abs(pnl_a) - abs(pnl_b))
         # signed
         return abs(pnl_a - pnl_b)
 
+    # --- шаг 3: возможно закрыть пару ---
     def maybe_close_chunk(self, pair: List[dict]):
-        if len(pair) != 2: return
+        if len(pair) != 2:
+            return
         a, b = pair
         pnl_a = float(a["unRealizedProfit"])
         pnl_b = float(b["unRealizedProfit"])
         gap = self._calc_gap(pnl_a, pnl_b)
 
-        self.logger.info("Gap(%s) между %s и %s: %.2f (порог %.2f)",
-                         self.pnl_gap_mode, a["symbol"], b["symbol"], gap, self.pnl_diff_usd)
+        self.logger.info("Gap(%s)=%0.2f vs threshold=%0.2f  |  pair=(%s:%0.2f, %s:%0.2f)",
+                         self.pnl_gap_mode, gap, self.pnl_diff_usd,
+                         a["symbol"], pnl_a, b["symbol"], pnl_b)
 
+        # В режиме 'plus' gap может быть отрицательным — это сигнал «не закрывать».
         if gap <= self.pnl_diff_usd:
-            self.logger.info("Gap=%.2f ≤ %.2f — не закрываем (%s vs %s).",
-                             gap, self.pnl_diff_usd, a["symbol"], b["symbol"])
+            self.logger.info("Условия НЕ выполнены — не закрываем.")
             return
 
-        self.logger.warning("Gap=%.2f > %.2f — закрываем ОБЕ: %s(%s) и %s(%s)",
-                            gap, self.pnl_diff_usd, a["symbol"], a["positionSide"], b["symbol"], b["positionSide"])
+        self.logger.warning("Условия выполнены ⇒ закрываем обе позиции: %s(%s) и %s(%s)",
+                            a["symbol"], a["positionSide"], b["symbol"], b["positionSide"])
 
         order1 = order2 = None
         if self.dry_run:
@@ -304,17 +329,17 @@ class ChunkCloserBot:
 
         close_iso = datetime.now().isoformat()
         self.closures_logger.info(
-            "CLOSE | mode=%s | %s & %s | posSides: %s/%s | Gap=%.2f | openA=%s openB=%s | dry_run=%s",
-            self.pnl_gap_mode, a["symbol"], b["symbol"], a["positionSide"], b["positionSide"], gap,
-            ts_ms_to_iso(a["updateTime"]), ts_ms_to_iso(b["updateTime"]), self.dry_run
+            "CLOSE | mode=%s | %s & %s | posSides: %s/%s | gap=%.2f | openA=%s openB=%s | dry_run=%s",
+            self.pnl_gap_mode, a["symbol"], b["symbol"], a["positionSide"], b["positionSide"],
+            gap, ts_ms_to_iso(a["updateTime"]), ts_ms_to_iso(b["updateTime"]), self.dry_run
         )
         with open(CLOSURES_CSV, "a", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow([
-                close_iso,
+                close_iso, self.pnl_gap_mode,
                 a["symbol"], b["symbol"],
                 a["positionSide"], b["positionSide"],
                 ts_ms_to_iso(a["updateTime"]), ts_ms_to_iso(b["updateTime"]),
-                pnl_a, pnl_b, gap,  # колонка называется pnl_diff_abs, но теперь тут наш gap
+                pnl_a, pnl_b, gap,
                 self.dry_run,
                 (order1 or {}).get("orderId") if isinstance(order1, dict) else None,
                 (order2 or {}).get("orderId") if isinstance(order2, dict) else None
@@ -338,8 +363,7 @@ class ChunkCloserBot:
                 self.run_once()
             except Exception as e:
                 self.logger.exception("Ошибка в итерации: %s", e)
-            sleep_s = max(0.0, POLL_SECONDS - (time.time() - start))
-            time.sleep(sleep_s)
+            time.sleep(max(0.0, POLL_SECONDS - (time.time() - start)))
 
 def main():
     try:
