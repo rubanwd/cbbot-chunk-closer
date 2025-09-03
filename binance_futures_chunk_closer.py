@@ -3,16 +3,21 @@
 """
 Binance USDT-M Futures chunk-closer bot (+ Telegram notify on close)
 
+Новое:
+- Динамический порог закрытия по GAP: PNL_DIFF_PCT (% от общего USDT баланса).
+  На каждой итерации порог считается как: threshold = balance_total_usdt * PNL_DIFF_PCT / 100.
+  Если PNL_DIFF_PCT не задан или баланс недоступен — используется запасной PNL_DIFF_USD.
+
 Ключевые моменты:
 - Снапшоты перезаписываются (balance.json, positions.json) + ежедневная очистка каталога snapshots/.
 - Логика «чанков» по 2 позиции. Закрытие по порогу GAP:
-    PNL_GAP_MODE=plus (по умолчанию): gap = pnl_a + pnl_b → закрываем только если gap > PNL_DIFF_USD.
+    PNL_GAP_MODE=plus (по умолчанию): gap = pnl_a + pnl_b → закрываем только если gap > threshold.
     magnitude: gap = | |p1| - |p2| |
     signed:    gap = | p1 - p2 |
 - После закрытия ПАРЫ отправляется Telegram-отчёт:
     • пары (символы, стороны, PnL)
     • дата/время закрытия (локальное)
-    • значение GAP и порог
+    • фактический порог (динамический)
     • «время жизни» чанка = now - max(updateTime обеих позиций)
 
 ENV:
@@ -20,8 +25,9 @@ ENV:
 - OUTPUT_DIR=./data
 - POLL_INTERVAL_SECONDS=60
 - BINANCE_BASE_URL=https://fapi.binance.com
-- PNL_DIFF_USD=40
 - PNL_GAP_MODE=plus | magnitude | signed
+- PNL_DIFF_PCT=2            # <-- новый способ задать порог (проценты от баланса)
+- PNL_DIFF_USD=40           # запасной фиксированный порог в USD
 - DRY_RUN=true/false
 - TELEGRAM_BOT_TOKEN=<token>
 - TELEGRAM_CHAT_ID=<id>
@@ -38,7 +44,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 from dotenv import load_dotenv
 from binance.um_futures import UMFutures
@@ -157,7 +163,17 @@ class ChunkCloserBot:
         self.base_url = DEFAULT_BASE_URL
 
         # --- логика закрытия
+        # запасной фиксированный порог (USD), если проценты недоступны
         self.pnl_diff_usd = float(os.getenv("PNL_DIFF_USD", "40"))
+        # новый: проценты от общего баланса USDT
+        self.pnl_diff_pct: Optional[float] = None
+        _pct = os.getenv("PNL_DIFF_PCT", "").strip()
+        if _pct:
+            try:
+                self.pnl_diff_pct = float(_pct)
+            except ValueError:
+                self.pnl_diff_pct = None
+
         self.pnl_gap_mode = os.getenv("PNL_GAP_MODE", "plus").lower().strip()
         if self.pnl_gap_mode not in ("plus", "magnitude", "signed"):
             self.pnl_gap_mode = "plus"
@@ -177,8 +193,10 @@ class ChunkCloserBot:
         self.client = BinanceClient(self.api_key, self.api_secret, self.base_url)
 
         self.logger.info(
-            "Старт. DRY_RUN=%s, GAP_MODE=%s, PNL_DIFF_USD=%.2f, Telegram=%s",
-            self.dry_run, self.pnl_gap_mode, self.pnl_diff_usd,
+            "Старт. DRY_RUN=%s, GAP_MODE=%s, PNL_DIFF_PCT=%s, PNL_DIFF_USD(backup)=%.2f, Telegram=%s",
+            self.dry_run, self.pnl_gap_mode,
+            f"{self.pnl_diff_pct}%" if self.pnl_diff_pct is not None else "N/A",
+            self.pnl_diff_usd,
             "on" if self.tg_enabled else "off"
         )
 
@@ -230,6 +248,33 @@ class ChunkCloserBot:
             self._last_cleanup_day = today
             self.logger.info("Ежедневная очистка snapshots выполнена.")
 
+    # -------- helpers --------
+    def _compute_threshold_usd(self, balance_summary: Dict) -> float:
+        """
+        Возвращает фактический порог закрытия в USD.
+        Если задан PNL_DIFF_PCT и удалось прочитать общий USDT баланс — берем проценты.
+        Иначе — возвращаем запасной PNL_DIFF_USD.
+        """
+        if self.pnl_diff_pct is not None and self.pnl_diff_pct > 0:
+            usdt = balance_summary.get("USDT", {})
+            total_str = usdt.get("balance")  # Binance UM Futures: total balance в поле "balance"
+            try:
+                total = float(total_str) if total_str is not None else None
+            except (TypeError, ValueError):
+                total = None
+            if total is not None:
+                th = total * (self.pnl_diff_pct / 100.0)
+                # защита от отрицательных/NaN
+                try:
+                    if not (th >= 0 or th <= 0):  # NaN check
+                        th = self.pnl_diff_usd
+                except Exception:
+                    pass
+                return max(0.0, th)
+            else:
+                self.logger.warning("Не удалось получить общий USDT баланс — использую PNL_DIFF_USD=%.2f", self.pnl_diff_usd)
+        return max(0.0, self.pnl_diff_usd)
+
     # -------- data fetch --------
     def fetch_and_log_account(self) -> Tuple[dict, List[dict]]:
         try:
@@ -240,7 +285,11 @@ class ChunkCloserBot:
         balance_summary = {b.get("asset"): b for b in bal_list}
         usdt_total = balance_summary.get("USDT", {}).get("balance")
         usdt_avail = balance_summary.get("USDT", {}).get("availableBalance")
-        self.logger.info("Баланс (USDT): total=%s, available=%s", usdt_total, usdt_avail)
+        # посчитаем и залогируем фактический порог
+        threshold_usd = self._compute_threshold_usd(balance_summary)
+        pct_info = f" ({self.pnl_diff_pct}% от {usdt_total})" if self.pnl_diff_pct is not None and usdt_total is not None else ""
+        self.logger.info("Баланс (USDT): total=%s, available=%s | Порог закрытия: %.2f%s",
+                         usdt_total, usdt_avail, threshold_usd, pct_info)
 
         try:
             pr_list = self.client.position_risk()
@@ -320,7 +369,7 @@ class ChunkCloserBot:
         return abs(pnl_a - pnl_b)
 
     # -------- close pair + Telegram notify --------
-    def maybe_close_chunk(self, pair: List[dict]):
+    def maybe_close_chunk(self, pair: List[dict], threshold_usd: float):
         if len(pair) != 2:
             return
         a, b = pair
@@ -328,11 +377,11 @@ class ChunkCloserBot:
         pnl_b = float(b["unRealizedProfit"])
         gap = self._calc_gap(pnl_a, pnl_b)
 
-        self.logger.info("Gap(%s)=%.2f (th=%.2f) | pair=(%s:%.2f, %s:%.2f)",
-                         self.pnl_gap_mode, gap, self.pnl_diff_usd,
+        self.logger.info("Gap(%s)=%.2f (threshold=%.2f) | pair=(%s:%.2f, %s:%.2f)",
+                         self.pnl_gap_mode, gap, threshold_usd,
                          a["symbol"], pnl_a, b["symbol"], pnl_b)
 
-        if gap <= self.pnl_diff_usd:
+        if gap <= threshold_usd:
             self.logger.info("Условия НЕ выполнены — не закрываем.")
             return
 
@@ -359,9 +408,9 @@ class ChunkCloserBot:
 
         # лог и CSV закрытий
         self.closures_logger.info(
-            "CLOSE | mode=%s | %s & %s | posSides: %s/%s | gap=%.2f | openA=%s openB=%s | dry_run=%s",
+            "CLOSE | mode=%s | %s & %s | posSides: %s/%s | gap=%.2f | threshold=%.2f | openA=%s openB=%s | dry_run=%s",
             self.pnl_gap_mode, a["symbol"], b["symbol"], a["positionSide"], b["positionSide"],
-            gap, ts_ms_to_iso(a["updateTime"]), ts_ms_to_iso(b["updateTime"]), self.dry_run
+            gap, threshold_usd, ts_ms_to_iso(a["updateTime"]), ts_ms_to_iso(b["updateTime"]), self.dry_run
         )
         with open(CLOSURES_CSV, "a", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow([
@@ -384,11 +433,12 @@ class ChunkCloserBot:
             msg_lines = [
                 "Binance — Чанк закрыт",
                 f"Время закрытия: {fmt_local(close_dt_local)}",
-                f"Gap({self.pnl_gap_mode}) = {gap:.2f}  |  Порог = {self.pnl_diff_usd:.2f}",
+                f"Gap({self.pnl_gap_mode}) = {gap:.2f}",
+                f"Порог закрытия: {threshold_usd:.2f}"
+                + (f" (из {self.pnl_diff_pct}% от баланса)" if self.pnl_diff_pct is not None else ""),
                 f"Время существования чанка: {chunk_age}",
                 "",
                 f"• {a['symbol']}  {a['positionSide']}  amt={a['positionAmt']}  uPnL={pnl_a:.2f}",
-                f"  Последний апдейт: {last_upd_dt.isoformat()}",
                 f"• {b['symbol']}  {b['positionSide']}  amt={b['positionAmt']}  uPnL={pnl_b:.2f}",
                 "",
                 f"Dry-run: {self.dry_run}",
@@ -401,12 +451,13 @@ class ChunkCloserBot:
 
     # -------- loop --------
     def run_once(self):
-        _, positions = self.fetch_and_log_account()
+        balance, positions = self.fetch_and_log_account()
+        threshold_usd = self._compute_threshold_usd(balance)
         if len(positions) > 1:
             chunks = self.make_chunks(positions)
             self.log_chunks(chunks)
             for pair in chunks:
-                self.maybe_close_chunk(pair)
+                self.maybe_close_chunk(pair, threshold_usd)
         else:
             self.logger.info("Для чанков нужно >1 открытая позиция.")
 
